@@ -390,6 +390,16 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
     # the client is going to spit some data at us over the data socket. Add
     # a callback that will execute when the client closes the socket. We more
     # or less just send an ACK back over the control port
+    set_callback(filename)
+  end
+
+  # only set callback when we have a valid datasocket
+  def set_callback(filename)
+    if @datasocket.nil?
+      EventMachine.next_tick { send_callback(filename) }
+      return
+    end
+
     @datasocket.callback do |data|
       # Since we're emulating an directory structure, don't actually save the
       # file.
