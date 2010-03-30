@@ -43,7 +43,6 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
   # complete
   #
   def receive_line(str)
-    puts "line: #{str}"
     # break the request into command and parameter components
     cmd, param = parse_request(str)
 
@@ -386,29 +385,7 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
     send_response "150 Data transfer starting"
 
     filename = build_path(param)
-
-    # the client is going to spit some data at us over the data socket. Add
-    # a callback that will execute when the client closes the socket. We more
-    # or less just send an ACK back over the control port
-    set_callback(filename)
-  end
-
-  # only set callback when we have a valid datasocket
-  def set_callback(filename)
-    if @datasocket.nil?
-      EventMachine.next_tick { send_callback(filename) }
-      return
-    end
-
-    @datasocket.callback do |data|
-      # Since we're emulating an directory structure, don't actually save the
-      # file.
-      #File.open(filename, 'w') do |file|
-      #  file.write data
-      #  send_response "200 OK, received #{data.size} bytes"
-      #end
-      send_response "200 OK, received #{data.size} bytes"
-    end
+    receive_outofband_data(filename)
   end
 
   # like the MODE and TYPE commands, stru[cture] dates back to a time when the FTP
@@ -463,10 +440,25 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
     send_response "331 OK, password required"
   end
 
-  # send data to the client
-  def send_outofband_data(data)
-    if @datasocket.nil?
-      EventMachine.next_tick { send_outofband_data(data)}
+  # send data to the client across the data socket.
+  #
+  # The data socket is NOT guaranteed to be setup by the time this method runs.
+  # If it isn't ready yet, exit the method and try again on the next reactor
+  # tick. This is particularly likely with some clients that operate in passive
+  # mode. They get a message on the control port with the data port details, so
+  # they start up a new data connection AND send they command that will use it
+  # in close succession.
+  #
+  # The data port setup needs to complete a TCP handshake before it will be
+  # ready to use, so it may take a few RTTs after the command is received at
+  # the server before the data socket is ready.
+  #
+  def send_outofband_data(data, interval = 0.1)
+    if @datasocket.nil? && interval < 25
+      EventMachine.add_timer(interval) { send_outofband_data(data, interval * 2)}
+      return
+    elsif @datasocket.nil?
+      send_response "425 Error establishing connection"
       return
     end
 
@@ -484,6 +476,34 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
     end
   rescue
     send_response "425 Error establishing connection"
+  end
+
+  # receive a file data from the client across the data socket.
+  #
+  # The data socket is NOT guaranteed to be setup by the time this method runs.
+  # If this happens, exit the method early and try again later. See the method
+  # comments to send_outofband_data for further explanation.
+  #
+  def receive_outofband_data(filename, interval = 0.1)
+    if @datasocket.nil? && interval < 25
+      EventMachine.add_timer(interval) { receive_outofband_data(filename, interval * 2)}
+      return
+    elsif @datasocket.nil?
+      send_response "425 Error establishing connection"
+    end
+
+    # the client is going to spit some data at us over the data socket. Add
+    # a callback that will execute when the client closes the socket. We more
+    # or less just send an ACK back over the control port
+    @datasocket.callback do |data|
+      # Since we're emulating a directory structure, don't actually save the
+      # file.
+      #File.open(filename, 'w') do |file|
+      #  file.write data
+      #  send_response "200 OK, received #{data.size} bytes"
+      #end
+      send_response "200 OK, received #{data.size} bytes"
+    end
   end
 
   # all responses from an FTP server end with \r\n, so wrap the
@@ -534,7 +554,7 @@ class FTPActiveDataSocket < EventMachine::Connection
   end
 
   def unbind
-    self.set_deferred_status :succeeded, @data
+    self.set_deferred_status :succeeded, data
   end
 end
 
@@ -572,7 +592,7 @@ class FTPPassiveDataSocket < EventMachine::Connection
   end
 
   def unbind
-    self.set_deferred_status :succeeded, @data
+    self.set_deferred_status :succeeded, data
   end
 end
 
